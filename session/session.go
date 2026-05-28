@@ -50,6 +50,7 @@ type Session struct {
 
 	// server
 	onNewStream func(stream *Stream)
+	lastFrameAt atomic.TypedValue[time.Time]
 }
 
 func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger) *Session {
@@ -62,6 +63,7 @@ func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.Paddin
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
+	s.lastFrameAt.Store(time.Now())
 	return s
 }
 
@@ -167,21 +169,30 @@ func (s *Session) OpenStream() (*Stream, error) {
 	}
 }
 
-// ServerRecvIdleTimeout caps how long a server-side session is allowed to
-// have no inbound frames at all before recvLoop tears it down. anytls has no
-// application-level heartbeat — a client that abandons a session (mobile
-// sleep, app crash, NAT drop, network partition) just stops sending, and
-// without this bound the server's `io.ReadFull` blocks indefinitely while the
-// goroutine, TLS state, and TCP socket remain pinned. Past production we saw
-// 27k+ such recvLoop goroutines accumulate and drive RSS past 1.9 GB on a
-// 131-node, 30k-connection front end. Set to 0 to disable (matches pre-patch
-// behavior). 10 minutes is generous enough that any genuinely-active client
-// will produce SOME frame (PSH data, cmdWaste padding alongside data, control
-// frames) inside the window; idle multiplexed sessions that simply hold an
-// open conn for the next request still survive because client libraries
-// periodically reuse them, and once an honest peer needs the conn again
-// they'll redial transparently if it was reaped.
-var ServerRecvIdleTimeout = 10 * time.Minute
+// ServerRecvIdleTimeout caps how long a server-side session may receive no
+// anytls frames before it is closed. Relying on net.Conn read deadlines is not
+// enough here because the session conn can be wrapped (TLS, CachedConn, etc.),
+// so a watchdog closes the session directly from the side.
+var ServerRecvIdleTimeout = 3 * time.Minute
+
+func (s *Session) runServerIdleReaper() {
+	if s.isClient || ServerRecvIdleTimeout <= 0 {
+		return
+	}
+	ticker := time.NewTicker(ServerRecvIdleTimeout / 3)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.die:
+			return
+		case <-ticker.C:
+			if time.Since(s.lastFrameAt.Load()) >= ServerRecvIdleTimeout {
+				s.Close()
+				return
+			}
+		}
+	}
+}
 
 func (s *Session) recvLoop() error {
 	// defer func() {
@@ -190,6 +201,9 @@ func (s *Session) recvLoop() error {
 	// 	}
 	// }()
 	defer s.Close()
+	if !s.isClient && ServerRecvIdleTimeout > 0 {
+		go s.runServerIdleReaper()
+	}
 
 	var receivedSettingsFromClient bool
 	var hdr rawHeader
@@ -198,19 +212,10 @@ func (s *Session) recvLoop() error {
 		if s.IsClosed() {
 			return io.ErrClosedPipe
 		}
-		// Arm the idle deadline only on the server side and only for header
-		// reads. The deadline is cleared before any body read below, so a
-		// large PSH payload over a slow link won't get clipped mid-frame —
-		// only the *gap between frames* counts toward idle.
-		if !s.isClient && ServerRecvIdleTimeout > 0 {
-			_ = s.conn.SetReadDeadline(time.Now().Add(ServerRecvIdleTimeout))
-		}
 		// read header first
 		if _, err := io.ReadFull(s.conn, hdr[:]); err == nil {
-			// Header arrived inside the idle window — clear the deadline so
-			// the body read below isn't subject to it. We re-arm next loop.
 			if !s.isClient && ServerRecvIdleTimeout > 0 {
-				_ = s.conn.SetReadDeadline(time.Time{})
+				s.lastFrameAt.Store(time.Now())
 			}
 			sid := hdr.StreamID()
 			switch hdr.Cmd() {
