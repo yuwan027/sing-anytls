@@ -175,6 +175,45 @@ func (s *Session) OpenStream() (*Stream, error) {
 // so a watchdog closes the session directly from the side.
 var ServerRecvIdleTimeout = 3 * time.Minute
 
+// abortConnOnClose arms the underlying TCP socket so the following Close sends
+// an RST instead of a graceful FIN. A graceful close of an abandoned session
+// whose kernel send buffer still holds undelivered proxy data parks the socket
+// in FIN-WAIT-1 for many minutes: the FIN queues behind up to tcp_wmem-max bytes
+// that the vanished client never ACKs, and the kernel keeps that whole buffer
+// (and retransmits it) until tcp_retries2 finally gives up. In production this
+// accumulated to hundreds of FIN-WAIT-1 sockets pinning multiple GiB of kernel
+// TCP memory. The session is already condemned, so the queued bytes are
+// worthless — SO_LINGER=0 lets Close discard the send buffer and free the
+// socket immediately.
+//
+// s.conn is wrapped (CachedConn -> badtls.ReadWaitConn -> *tls.Conn -> *net.TCPConn);
+// every layer exposes NetConn() or Upstream(), so we walk down to the raw socket.
+func abortConnOnClose(conn net.Conn) {
+	if tc := underlyingTCPConn(conn); tc != nil {
+		_ = tc.SetLinger(0)
+	}
+}
+
+// underlyingTCPConn walks the wrapper chain to the raw *net.TCPConn, returning
+// nil if a layer doesn't expose NetConn()/Upstream(). The bound guards against a
+// pathological cycle.
+func underlyingTCPConn(conn net.Conn) *net.TCPConn {
+	for i := 0; i < 8 && conn != nil; i++ {
+		switch c := conn.(type) {
+		case *net.TCPConn:
+			return c
+		case interface{ NetConn() net.Conn }:
+			conn = c.NetConn()
+		case interface{ Upstream() any }:
+			u, _ := c.Upstream().(net.Conn)
+			conn = u
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func (s *Session) runServerIdleReaper() {
 	if s.isClient || ServerRecvIdleTimeout <= 0 {
 		return
@@ -187,6 +226,10 @@ func (s *Session) runServerIdleReaper() {
 			return
 		case <-ticker.C:
 			if time.Since(s.lastFrameAt.Load()) >= ServerRecvIdleTimeout {
+				// Abandoned session: RST so the kernel drops any send buffer
+				// stuck behind a client that stopped reading, instead of
+				// lingering in FIN-WAIT-1 holding that memory.
+				abortConnOnClose(s.conn)
 				s.Close()
 				return
 			}
